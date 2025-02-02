@@ -1,4 +1,6 @@
 #include <stdio.h>
+#include <string.h>
+#include <stdlib.h>
 #include "esp_system.h"
 #include "esp_log.h"
 #include "esp_err.h"
@@ -9,236 +11,324 @@
 #include "nvs_flash.h"
 #include "esp_netif.h"
 #include "esp_http_server.h"
+#include "esp_http_client.h"
+#include "esp_timer.h"
+#include "esp_rom_sys.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
 
-#define LED_GPIO 12
-#define SERVO_GPIO 13
-#define TRIGGER_GPIO 5
-#define ECHO_GPIO 18
+// Function declarations
+void send_to_server(const char* endpoint, const char* data);
+static float get_distance(void);
+static bool check_water_level(int cups_requested);
+void coffee_brewing_task(void *pvParameters);
 
-#define SERVO_MIN_PULSEWIDTH 500  // Pulso mínimo para 0 grados (microsegundos)
-#define SERVO_MAX_PULSEWIDTH 2500 // Pulso máximo para 180 grados (microsegundos)
-#define SERVO_MAX_DEGREE 180      // Grados máximos de rotación
 
-static const char *TAG = "example";
-static int led_state = 0;
-static int servo_angle = 0;
-static bool servo_direction = true; // true = hacia 180, false = hacia 0
+// Function declarations
+void send_to_server(const char* endpoint, const char* data);
+static float get_distance(void);
+static bool check_water_level(int cups_requested);
+void coffee_brewing_task(void *pvParameters);
 
-// Función para convertir ángulos a ciclo de trabajo
+// GPIO Pin definitions
+#define LED_GPIO 12        
+#define SERVO_GPIO 13      
+#define TRIGGER_GPIO 5     
+#define ECHO_GPIO 18       
+
+// Servo configuration
+#define SERVO_MIN_PULSEWIDTH 500   
+#define SERVO_MAX_PULSEWIDTH 2500  
+#define SERVO_MAX_DEGREE 180       
+
+// Global variables
+static const char *TAG = "coffee-maker";
+static int daily_uses = 0;
+static int total_cups = 0;
+static const char* SERVER_URL = "http://192.168.1.23:8087";
+
+// Convert angle to duty cycle for servo
 static uint32_t degree_to_duty(int degree) {
     uint32_t pulse_width = SERVO_MIN_PULSEWIDTH + (((SERVO_MAX_PULSEWIDTH - SERVO_MIN_PULSEWIDTH) * degree) / SERVO_MAX_DEGREE);
     uint32_t duty = (pulse_width * ((1 << 13) - 1)) / 20000;
     return duty;
 }
 
-// Función para medir la distancia usando el sensor ultrasónico
-static uint32_t get_distance() {
+// Measure distance with ultrasonic sensor
+static float get_distance(void) {
     gpio_set_level(TRIGGER_GPIO, 0);
     esp_rom_delay_us(2);
+    
     gpio_set_level(TRIGGER_GPIO, 1);
     esp_rom_delay_us(10);
     gpio_set_level(TRIGGER_GPIO, 0);
-
-    uint32_t pulse_duration = 0;
+    
+    int64_t start = esp_timer_get_time();
     while (gpio_get_level(ECHO_GPIO) == 0) {
-        pulse_duration++;
-        if (pulse_duration > 100000) break;  // Timeout si no se recibe el eco
+        if (esp_timer_get_time() - start > 30000) {
+            return -1;
+        }
     }
-
-    pulse_duration = 0;
+    
+    start = esp_timer_get_time();
     while (gpio_get_level(ECHO_GPIO) == 1) {
-        pulse_duration++;
-        if (pulse_duration > 100000) break;  // Timeout si no se recibe el eco
+        if (esp_timer_get_time() - start > 30000) {
+            return -1;
+        }
     }
-
-    uint32_t distance = pulse_duration * 0.034 / 2; // Distancia en cm
+    int64_t end = esp_timer_get_time();
+    
+    float distance = ((end - start) * 0.0343) / 2;
     return distance;
 }
 
-// Página HTML de control
-const char html_page[] = "\
-<!DOCTYPE html>\
+// Check water level
+static bool check_water_level(int cups_requested) {
+    float distance = get_distance();
+    if (distance < 0) return false;
+    
+    float water_level = 10 - distance;
+    float water_needed = cups_requested * 0.5;
+    
+    // Si el nivel de agua es crítico, enviar alerta
+    if (water_level < 2.0) {
+        char alert_data[100];
+        snprintf(alert_data, sizeof(alert_data), 
+                "{\"status\":\"low\",\"waterLevel\":%.1f}", 
+                water_level);
+        send_to_server("/water_alert", alert_data);
+    }
+    
+    return water_level >= water_needed;
+}
+
+// Coffee brewing task
+void coffee_brewing_task(void *pvParameters) {
+    int cups = *(int*)pvParameters;
+    free(pvParameters);  // Free the allocated memory
+    
+    int brewing_time = (cups == 2) ? 300 : (cups == 4) ? 600 : 900;
+    
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, degree_to_duty(180));
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    
+    vTaskDelay(brewing_time * 1000 / portTICK_PERIOD_MS);
+    
+    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, degree_to_duty(0));
+    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
+    
+    gpio_set_level(LED_GPIO, 0);
+    
+    char data[100];
+    snprintf(data, sizeof(data), "{\"uses\":1,\"cups\":%d,\"waterLevel\":%.1f}", 
+             cups, 10 - get_distance());
+    send_to_server("/update_stats", data);
+    
+    vTaskDelete(NULL);
+}
+
+// Send data to server with retry mechanism
+void send_to_server(const char* endpoint, const char* data) {
+    char url[100];
+    snprintf(url, sizeof(url), "%s%s", SERVER_URL, endpoint);
+    
+    esp_http_client_config_t config = {
+        .url = url,
+        .method = HTTP_METHOD_POST,
+        .timeout_ms = 5000,
+        .keep_alive_enable = true
+    };
+    
+    int retry_count = 0;
+    while (retry_count < 3) {
+        esp_http_client_handle_t client = esp_http_client_init(&config);
+        if (client == NULL) {
+            ESP_LOGE(TAG, "Failed to initialize HTTP client");
+            vTaskDelay(1000 / portTICK_PERIOD_MS);
+            retry_count++;
+            continue;
+        }
+        
+        esp_http_client_set_post_field(client, data, strlen(data));
+        esp_http_client_set_header(client, "Content-Type", "application/json");
+        
+        esp_err_t err = esp_http_client_perform(client);
+        if (err == ESP_OK) {
+            int status_code = esp_http_client_get_status_code(client);
+            if (status_code == 200) {
+                ESP_LOGI(TAG, "Data sent successfully to %s", endpoint);
+                esp_http_client_cleanup(client);
+                return;
+            }
+        }
+        
+        ESP_LOGW(TAG, "Failed to send data (attempt %d/3): %s", 
+                 retry_count + 1, esp_err_to_name(err));
+        
+        esp_http_client_cleanup(client);
+        vTaskDelay((1000 * (retry_count + 1)) / portTICK_PERIOD_MS);
+        retry_count++;
+    }
+    
+    ESP_LOGE(TAG, "Failed to send data after 3 attempts");
+}
+
+
+// HTML page
+const char html_page[] = "<!DOCTYPE html>\
 <html>\
 <head>\
-    <title>Control LED y Servo</title>\
+    <title>Control de Cafetera IoT</title>\
     <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
     <style>\
-        body { font-family: Arial, sans-serif; text-align: center; background-color: #f3e5f5; color: #4a148c; margin: 20px; }\
-        h1 { color: #6a1b9a; }\
-        button { background-color: #8e24aa; color: white; padding: 10px 20px; border: none; border-radius: 5px; cursor: pointer; margin: 10px; }\
-        button:hover { background-color: #7b1fa2; }\
+        body { font-family: Arial; text-align: center; background: #f5f5f5; }\
+        .container { max-width: 600px; margin: 0 auto; padding: 20px; }\
+        .control-panel { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; }\
+        select, button { padding: 10px; margin: 10px; }\
         .status { margin: 20px 0; }\
     </style>\
 </head>\
 <body>\
-    <h1>Control de LED y Servo</h1>\
-    <div class=\"status\">\
-        <p>Estado del LED: <strong id=\"led_status\">Apagado</strong></p>\
-        <button onclick=\"toggleLED()\">Encender/Apagar LED</button>\
-    </div>\
-    <div class=\"status\">\
-        <p>Estado del Servo: <strong id=\"servo_status\">Ángulo: 0°</strong></p>\
-        <button onclick=\"moveServo()\">Mover Servo 0° - 180°</button>\
-    </div>\
-    <div class=\"status\">\
-        <p>Distancia: <strong id=\"distance\">Calculando...</strong></p>\
-        <button onclick=\"getDistance()\">Obtener Distancia</button>\
+    <div class=\"container\">\
+        <h1>Cafetera IoT</h1>\
+        <div class=\"control-panel\">\
+            <h2>Control de Preparación</h2>\
+            <select id=\"cups\">\
+                <option value=\"2\">2 Tazas (5 min)</option>\
+                <option value=\"4\">4 Tazas (10 min)</option>\
+                <option value=\"8\">8 Tazas (15 min)</option>\
+            </select>\
+            <button onclick=\"startCoffee()\">Preparar Café</button>\
+        </div>\
+        <div class=\"status\">\
+            <h3>Estado</h3>\
+            <p>Nivel de agua: <span id=\"waterLevel\">Midiendo...</span></p>\
+            <p>Estado: <span id=\"status\">Listo</span></p>\
+            <button onclick=\"checkWater()\">Verificar Agua</button>\
+        </div>\
     </div>\
     <script>\
-        function toggleLED() {\
-            fetch('/toggle_led', { method: 'POST' })\
-                .then(response => response.text())\
-                .then(state => {\
-                    document.getElementById('led_status').innerText = state === '1' ? 'Encendido' : 'Apagado';\
-                })\
-                .catch(error => console.error('Error:', error));\
+        function startCoffee() {\
+            const cups = document.getElementById('cups').value;\
+            fetch('/make_coffee', {\
+                method: 'POST',\
+                body: JSON.stringify({ cups: cups })\
+            })\
+            .then(response => response.text())\
+            .then(result => {\
+                document.getElementById('status').innerText = result;\
+            });\
         }\
-        function moveServo() {\
-            fetch('/move_servo', { method: 'POST' })\
-                .then(response => response.text())\
-                .then(angle => {\
-                    document.getElementById('servo_status').innerText = 'Ángulo: ' + angle + '°';\
-                })\
-                .catch(error => console.error('Error:', error));\
-        }\
-        function getDistance() {\
-            fetch('/get_distance', { method: 'POST' })\
-                .then(response => response.text())\
-                .then(distance => {\
-                    document.getElementById('distance').innerText = distance + ' cm';\
-                })\
-                .catch(error => console.error('Error:', error));\
+        function checkWater() {\
+            fetch('/check_water', { method: 'POST' })\
+            .then(response => response.text())\
+            .then(level => {\
+                document.getElementById('waterLevel').innerText = level;\
+            });\
         }\
     </script>\
 </body>\
 </html>";
 
-// Controlador de la página principal
+// HTTP handlers
 static esp_err_t page_handler(httpd_req_t *req) {
     httpd_resp_set_type(req, "text/html");
-    httpd_resp_send(req, html_page, HTTPD_RESP_USE_STRLEN);
+    httpd_resp_send(req, html_page, strlen(html_page));
     return ESP_OK;
 }
 
-// Controlador para encender y apagar el LED
-static esp_err_t toggle_led_handler(httpd_req_t *req) {
-    led_state = !led_state;
-    gpio_set_level(LED_GPIO, led_state);
-    char resp[4];
-    snprintf(resp, sizeof(resp), "%d", led_state);
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-// Controlador para mover el servo
-static esp_err_t move_servo_handler(httpd_req_t *req) {
-    if (servo_direction) {
-        servo_angle = 180;
-    } else {
-        servo_angle = 0;
-    }
-    servo_direction = !servo_direction;
-
-    uint32_t duty = degree_to_duty(servo_angle);
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, duty);
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-
-    char resp[4];
-    snprintf(resp, sizeof(resp), "%d", servo_angle);
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
-    return ESP_OK;
-}
-
-// Controlador para obtener la distancia del sensor ultrasónico
-static esp_err_t get_distance_handler(httpd_req_t *req) {
-    uint32_t distance = get_distance();
+static esp_err_t check_water_handler(httpd_req_t *req) {
+    float distance = get_distance();
+    float water_level = 10 - distance;
+    
     char resp[50];
-    snprintf(resp, sizeof(resp), "Distancia: %lu cm", distance);
-    httpd_resp_set_type(req, "text/plain");
-    httpd_resp_send(req, resp, HTTPD_RESP_USE_STRLEN);
+    snprintf(resp, sizeof(resp), "%.1f cm", water_level);
+    httpd_resp_send(req, resp, strlen(resp));
     return ESP_OK;
 }
 
-// Configuración de los URI
-static const httpd_uri_t uri_page = {
-    .uri      = "/",
-    .method   = HTTP_GET,
-    .handler  = page_handler,
+static esp_err_t make_coffee_handler(httpd_req_t *req) {
+    char buf[100];
+    int received = httpd_req_recv(req, buf, sizeof(buf));
+    if (received <= 0) return ESP_FAIL;
+    
+    int cups = 2;
+    if (strstr(buf, "\"cups\":\"4\"")) cups = 4;
+    if (strstr(buf, "\"cups\":\"8\"")) cups = 8;
+    
+    if (!check_water_level(cups)) {
+        httpd_resp_send(req, "Nivel de agua insuficiente", HTTPD_RESP_USE_STRLEN);
+        send_to_server("/water_alert", "{\"status\":\"low\"}");
+        return ESP_OK;
+    }
+    
+    gpio_set_level(LED_GPIO, 1);
+    
+    daily_uses++;
+    total_cups += cups;
+    
+    int *cups_param = malloc(sizeof(int));
+    if (cups_param == NULL) {
+        httpd_resp_send(req, "Error de memoria", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+    *cups_param = cups;
+    
+    BaseType_t task_created = xTaskCreate(coffee_brewing_task, "coffee_brewing", 2048, cups_param, 5, NULL);
+    if (task_created != pdPASS) {
+        free(cups_param);
+        httpd_resp_send(req, "Error al crear tarea", HTTPD_RESP_USE_STRLEN);
+        return ESP_FAIL;
+    }
+    
+    char response[100];
+    snprintf(response, sizeof(response), "Preparando %d tazas de café", cups);
+    httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
+    
+    return ESP_OK;
+}
+
+// URI handlers configuration
+static httpd_uri_t uri_get = {
+    .uri = "/",
+    .method = HTTP_GET,
+    .handler = page_handler,
     .user_ctx = NULL
 };
 
-static const httpd_uri_t uri_toggle_led = {
-    .uri      = "/toggle_led",
-    .method   = HTTP_POST,
-    .handler  = toggle_led_handler,
+static httpd_uri_t uri_check_water = {
+    .uri = "/check_water",
+    .method = HTTP_POST,
+    .handler = check_water_handler,
     .user_ctx = NULL
 };
 
-static const httpd_uri_t uri_move_servo = {
-    .uri      = "/move_servo",
-    .method   = HTTP_POST,
-    .handler  = move_servo_handler,
+static httpd_uri_t uri_make_coffee = {
+    .uri = "/make_coffee",
+    .method = HTTP_POST,
+    .handler = make_coffee_handler,
     .user_ctx = NULL
 };
 
-static const httpd_uri_t uri_get_distance = {
-    .uri      = "/get_distance",
-    .method   = HTTP_POST,
-    .handler  = get_distance_handler,
-    .user_ctx = NULL
-};
 
-// Función para iniciar el servidor web
+// Start web server
 static httpd_handle_t start_webserver(void) {
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
     config.stack_size = 8192;
     httpd_handle_t server = NULL;
 
-    ESP_LOGI(TAG, "Starting server on port: '%d'", config.server_port);
-    
     if (httpd_start(&server, &config) == ESP_OK) {
-        ESP_LOGI(TAG, "Registering URI handlers");
-        httpd_register_uri_handler(server, &uri_page);
-        httpd_register_uri_handler(server, &uri_toggle_led);
-        httpd_register_uri_handler(server, &uri_move_servo);
-        httpd_register_uri_handler(server, &uri_get_distance);
+        httpd_register_uri_handler(server, &uri_get);
+        httpd_register_uri_handler(server, &uri_check_water);
+        httpd_register_uri_handler(server, &uri_make_coffee);
         return server;
     }
 
-    ESP_LOGI(TAG, "Error starting server!");
     return NULL;
 }
 
-// Función de conexión Wi-Fi
-#define WIFI_SSID "Casa_GROB_ROSERO"
-#define WIFI_PASSWORD "laClave;-)"
-
-static void wifi_init_sta(void) {
-    esp_netif_init();
-    esp_event_loop_create_default();
-    esp_netif_create_default_wifi_sta();
-
-    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
-    esp_wifi_init(&cfg);
-    esp_wifi_set_mode(WIFI_MODE_STA);
-    esp_wifi_start();
-
-    wifi_config_t wifi_config = {
-        .sta = {
-            .ssid = WIFI_SSID,
-            .password = WIFI_PASSWORD,
-        },
-    };
-    esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config);
-    esp_wifi_connect();
-}
-
-// Función principal
+// Main function
 void app_main(void) {
-    ESP_LOGI(TAG, "Starting application...");
-
     esp_err_t ret = nvs_flash_init();
     if (ret == ESP_ERR_NVS_NO_FREE_PAGES || ret == ESP_ERR_NVS_NEW_VERSION_FOUND) {
         ESP_ERROR_CHECK(nvs_flash_erase());
@@ -246,35 +336,52 @@ void app_main(void) {
     }
     ESP_ERROR_CHECK(ret);
 
-    ESP_LOGI(TAG, "Initializing network...");
-    wifi_init_sta();
-
-    ESP_LOGI(TAG, "Configuring LED...");
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
-    gpio_set_level(LED_GPIO, led_state);
 
-    ESP_LOGI(TAG, "Configuring servo...");
+    gpio_reset_pin(TRIGGER_GPIO);
+    gpio_reset_pin(ECHO_GPIO);
+    gpio_set_direction(TRIGGER_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_direction(ECHO_GPIO, GPIO_MODE_INPUT);
+
     ledc_timer_config_t ledc_timer = {
         .speed_mode = LEDC_LOW_SPEED_MODE,
         .timer_num = LEDC_TIMER_0,
         .duty_resolution = LEDC_TIMER_13_BIT,
         .freq_hz = 50,
-        .clk_cfg = LEDC_USE_APB_CLK
+        .clk_cfg = LEDC_AUTO_CLK
     };
     ledc_timer_config(&ledc_timer);
 
     ledc_channel_config_t ledc_channel = {
+        .channel = LEDC_CHANNEL_0,
+        .duty = 0,
         .gpio_num = SERVO_GPIO,
         .speed_mode = LEDC_LOW_SPEED_MODE,
-        .channel = LEDC_CHANNEL_0,
-        .intr_type = LEDC_INTR_DISABLE,
-        .timer_sel = LEDC_TIMER_0,
-        .duty = degree_to_duty(servo_angle),
-        .hpoint = 0
+        .hpoint = 0,
+        .timer_sel = LEDC_TIMER_0
     };
     ledc_channel_config(&ledc_channel);
 
-    ESP_LOGI(TAG, "Starting server...");
+    ESP_ERROR_CHECK(esp_netif_init());
+    ESP_ERROR_CHECK(esp_event_loop_create_default());
+    esp_netif_create_default_wifi_sta();
+
+    // Configuración WiFi
+    wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
+    ESP_ERROR_CHECK(esp_wifi_init(&cfg));
+    ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
+
+    wifi_config_t wifi_config = {
+        .sta = {
+            .ssid = "Casa_GROB_ROSERO",
+            .password = "laClave;-)",
+        },
+    };
+
+    ESP_ERROR_CHECK(esp_wifi_set_config(ESP_IF_WIFI_STA, &wifi_config));
+    ESP_ERROR_CHECK(esp_wifi_start());
+    ESP_ERROR_CHECK(esp_wifi_connect());
+
     start_webserver();
 }
