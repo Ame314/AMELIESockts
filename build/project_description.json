@@ -1,7 +1,7 @@
 {
     "version":            "1.1",
     "project_name":       "AMELIESockts",
-    "project_version":    "2183956-dirty",
+    "project_version":    "034f83f-dirty",
     "project_path":       "/home/ame/Downloads/AMELIESockts",
     "idf_path":           "/home/ame/esp/esp-idf",
     "build_dir":          "/home/ame/Downloads/AMELIESockts/build",
@@ -1345,7 +1345,7 @@
             "managed_reqs": [],
             "managed_priv_reqs": [],
             "file": "/home/ame/Downloads/AMELIESockts/build/esp-idf/protocol_examples_common/libprotocol_examples_common.a",
-            "sources": [ "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/stdin_out.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/addr_from_stdin.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/connect.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/wifi_connect.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/protocol_examples_utils.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/console_cmd.c" ],
+            "sources": [ "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/stdin_out.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/addr_from_stdin.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/connect.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/wifi_connect.c", "/home/ame/esp/esp-idf/examples/common_components/protocol_examples_common/protocol_examples_utils.c" ],
             "include_dirs": [ "include" ]
         },
         "protocomm": {

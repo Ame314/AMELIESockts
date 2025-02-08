@@ -5,7 +5,6 @@
 #include "esp_log.h"
 #include "esp_err.h"
 #include "driver/gpio.h"
-#include "driver/ledc.h"
 #include "esp_wifi.h"
 #include "esp_event.h"
 #include "nvs_flash.h"
@@ -23,36 +22,17 @@ static float get_distance(void);
 static bool check_water_level(int cups_requested);
 void coffee_brewing_task(void *pvParameters);
 
-
-// Function declarations
-void send_to_server(const char* endpoint, const char* data);
-static float get_distance(void);
-static bool check_water_level(int cups_requested);
-void coffee_brewing_task(void *pvParameters);
-
 // GPIO Pin definitions
 #define LED_GPIO 12        
-#define SERVO_GPIO 13      
 #define TRIGGER_GPIO 5     
-#define ECHO_GPIO 18       
-
-// Servo configuration
-#define SERVO_MIN_PULSEWIDTH 500   
-#define SERVO_MAX_PULSEWIDTH 2500  
-#define SERVO_MAX_DEGREE 180       
+#define ECHO_GPIO 18    
+#define RELAY_GPIO 27
 
 // Global variables
 static const char *TAG = "coffee-maker";
 static int daily_uses = 0;
 static int total_cups = 0;
 static const char* SERVER_URL = "http://192.168.1.23:8087";
-
-// Convert angle to duty cycle for servo
-static uint32_t degree_to_duty(int degree) {
-    uint32_t pulse_width = SERVO_MIN_PULSEWIDTH + (((SERVO_MAX_PULSEWIDTH - SERVO_MIN_PULSEWIDTH) * degree) / SERVO_MAX_DEGREE);
-    uint32_t duty = (pulse_width * ((1 << 13) - 1)) / 20000;
-    return duty;
-}
 
 // Measure distance with ultrasonic sensor
 static float get_distance(void) {
@@ -90,7 +70,6 @@ static bool check_water_level(int cups_requested) {
     float water_level = 10 - distance;
     float water_needed = cups_requested * 0.5;
     
-    // Si el nivel de agua es crítico, enviar alerta
     if (water_level < 2.0) {
         char alert_data[100];
         snprintf(alert_data, sizeof(alert_data), 
@@ -105,25 +84,26 @@ static bool check_water_level(int cups_requested) {
 // Coffee brewing task
 void coffee_brewing_task(void *pvParameters) {
     int cups = *(int*)pvParameters;
-    free(pvParameters);  // Free the allocated memory
-    
-    int brewing_time = (cups == 2) ? 300 : (cups == 4) ? 600 : 900;
-    
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, degree_to_duty(180));
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    
+    free(pvParameters);
+
+    int brewing_time = (cups == 2) ? 100 : (cups == 4) ? 200 : 400;
+
+    // Turn on relay and LED
+    gpio_set_level(RELAY_GPIO, 1);  // Turn on relay (active low) 0
+    gpio_set_level(LED_GPIO, 1);    // Turn on LED
+
+    // Wait for brewing time
     vTaskDelay(brewing_time * 1000 / portTICK_PERIOD_MS);
     
-    ledc_set_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0, degree_to_duty(0));
-    ledc_update_duty(LEDC_LOW_SPEED_MODE, LEDC_CHANNEL_0);
-    
-    gpio_set_level(LED_GPIO, 0);
-    
+    // Turn off relay and LED
+    gpio_set_level(RELAY_GPIO, 0);  // Turn off relay
+    gpio_set_level(LED_GPIO, 0);    // Turn off LED
+
     char data[100];
     snprintf(data, sizeof(data), "{\"uses\":1,\"cups\":%d,\"waterLevel\":%.1f}", 
              cups, 10 - get_distance());
     send_to_server("/update_stats", data);
-    
+
     vTaskDelete(NULL);
 }
 
@@ -173,61 +153,70 @@ void send_to_server(const char* endpoint, const char* data) {
     ESP_LOGE(TAG, "Failed to send data after 3 attempts");
 }
 
-
 // HTML page
-const char html_page[] = "<!DOCTYPE html>\
-<html>\
-<head>\
-    <title>Control de Cafetera IoT</title>\
-    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\
-    <style>\
-        body { font-family: Arial; text-align: center; background: #f5f5f5; }\
-        .container { max-width: 600px; margin: 0 auto; padding: 20px; }\
-        .control-panel { background: white; padding: 20px; border-radius: 8px; margin: 20px 0; }\
-        select, button { padding: 10px; margin: 10px; }\
-        .status { margin: 20px 0; }\
-    </style>\
-</head>\
-<body>\
-    <div class=\"container\">\
-        <h1>Cafetera IoT</h1>\
-        <div class=\"control-panel\">\
-            <h2>Control de Preparación</h2>\
-            <select id=\"cups\">\
-                <option value=\"2\">2 Tazas (5 min)</option>\
-                <option value=\"4\">4 Tazas (10 min)</option>\
-                <option value=\"8\">8 Tazas (15 min)</option>\
-            </select>\
-            <button onclick=\"startCoffee()\">Preparar Café</button>\
-        </div>\
-        <div class=\"status\">\
-            <h3>Estado</h3>\
-            <p>Nivel de agua: <span id=\"waterLevel\">Midiendo...</span></p>\
-            <p>Estado: <span id=\"status\">Listo</span></p>\
-            <button onclick=\"checkWater()\">Verificar Agua</button>\
-        </div>\
-    </div>\
-    <script>\
-        function startCoffee() {\
-            const cups = document.getElementById('cups').value;\
-            fetch('/make_coffee', {\
-                method: 'POST',\
-                body: JSON.stringify({ cups: cups })\
-            })\
-            .then(response => response.text())\
-            .then(result => {\
-                document.getElementById('status').innerText = result;\
-            });\
-        }\
-        function checkWater() {\
-            fetch('/check_water', { method: 'POST' })\
-            .then(response => response.text())\
-            .then(level => {\
-                document.getElementById('waterLevel').innerText = level;\
-            });\
-        }\
-    </script>\
-</body>\
+const char html_page[] = "<!DOCTYPE html>\n\
+<html>\n\
+<head>\n\
+    <title>Control de Cafetera IoT</title>\n\
+    <meta name=\"viewport\" content=\"width=device-width, initial-scale=1\">\n\
+    <style>\n\
+        body { font-family: Arial, sans-serif; text-align: center; background:rgb(233, 208, 250); margin: 0; padding: 0; }\n\
+        .container { max-width: 500px; margin: 50px auto; padding: 20px; background: white; border-radius: 10px; box-shadow: 0 4px 8px rgba(0,0,0,0.2); }\n\
+        h1 { color: #333; }\n\
+        .control-panel, .status { padding: 20px; border-radius: 8px; margin: 20px 0; background:rgb(197, 198, 243); }\n\
+        select, button { width: 100%; padding: 10px; margin-top: 10px; border: none; border-radius: 5px; font-size: 16px; }\n\
+        button { background:rgb(159, 250, 85); color: white; cursor: pointer; transition: 0.3s; }\n\
+        button:hover { background:rgb(118, 247, 86); }\n\
+        .status p { font-size: 18px; }\n\
+    </style>\n\
+</head>\n\
+<body>\n\
+    <div class=\"container\">\n\
+        <h1>Cafetera IoT</h1>\n\
+        <div class=\"control-panel\">\n\
+            <h2>Control de Preparacion</h2>\n\
+            <select id=\"cups\">\n\
+                <option value=\"2\">2 Tazas (1 min 40 seg)</option>\n\
+                <option value=\"4\">4 Tazas (3 min 20 seg)</option>\n\
+                <option value=\"8\">8 Tazas (6 min 40 seg)</option>\n\
+            </select>\n\
+            <button onclick=\"startCoffee()\">Preparar Cafe</button>\n\
+        </div>\n\
+        <div class=\"status\">\n\
+            <h3>Estado</h3>\n\
+            <p>Nivel de agua: <span id=\"waterLevel\">Midiendo...</span></p>\n\
+            <p>Estado: <span id=\"status\">Listo</span></p>\n\
+            <button onclick=\"checkWater()\">Verificar Agua</button>\n\
+        </div>\n\
+    </div>\n\
+    <script>\n\
+        async function startCoffee() {\n\
+            const cups = document.getElementById('cups').value;\n\
+            document.getElementById('status').innerText = 'Preparando...';\n\
+            try {\n\
+                const response = await fetch('/make_coffee', {\n\
+                    method: 'POST',\n\
+                    headers: { 'Content-Type': 'application/json' },\n\
+                    body: JSON.stringify({ cups })\n\
+                });\n\
+                const result = await response.text();\n\
+                document.getElementById('status').innerText = result;\n\
+            } catch (error) {\n\
+                document.getElementById('status').innerText = 'Error al preparar cafe';\n\
+            }\n\
+        }\n\
+        async function checkWater() {\n\
+            document.getElementById('waterLevel').innerText = 'Verificando...';\n\
+            try {\n\
+                const response = await fetch('/check_water', { method: 'POST' });\n\
+                const level = await response.text();\n\
+                document.getElementById('waterLevel').innerText = level;\n\
+            } catch (error) {\n\
+                document.getElementById('waterLevel').innerText = 'Error al verificar';\n\
+            }\n\
+        }\n\
+    </script>\n\
+</body>\n\
 </html>";
 
 // HTTP handlers
@@ -282,7 +271,7 @@ static esp_err_t make_coffee_handler(httpd_req_t *req) {
     }
     
     char response[100];
-    snprintf(response, sizeof(response), "Preparando %d tazas de café", cups);
+    snprintf(response, sizeof(response), "Preparando %d tazas de cafe", cups);
     httpd_resp_send(req, response, HTTPD_RESP_USE_STRLEN);
     
     return ESP_OK;
@@ -309,7 +298,6 @@ static httpd_uri_t uri_make_coffee = {
     .handler = make_coffee_handler,
     .user_ctx = NULL
 };
-
 
 // Start web server
 static httpd_handle_t start_webserver(void) {
@@ -338,36 +326,19 @@ void app_main(void) {
 
     gpio_reset_pin(LED_GPIO);
     gpio_set_direction(LED_GPIO, GPIO_MODE_OUTPUT);
+    gpio_reset_pin(RELAY_GPIO);
+    gpio_set_direction(RELAY_GPIO, GPIO_MODE_OUTPUT);
+    gpio_set_level(RELAY_GPIO, 1);  // Initialize relay as off
 
     gpio_reset_pin(TRIGGER_GPIO);
     gpio_reset_pin(ECHO_GPIO);
     gpio_set_direction(TRIGGER_GPIO, GPIO_MODE_OUTPUT);
     gpio_set_direction(ECHO_GPIO, GPIO_MODE_INPUT);
 
-    ledc_timer_config_t ledc_timer = {
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .timer_num = LEDC_TIMER_0,
-        .duty_resolution = LEDC_TIMER_13_BIT,
-        .freq_hz = 50,
-        .clk_cfg = LEDC_AUTO_CLK
-    };
-    ledc_timer_config(&ledc_timer);
-
-    ledc_channel_config_t ledc_channel = {
-        .channel = LEDC_CHANNEL_0,
-        .duty = 0,
-        .gpio_num = SERVO_GPIO,
-        .speed_mode = LEDC_LOW_SPEED_MODE,
-        .hpoint = 0,
-        .timer_sel = LEDC_TIMER_0
-    };
-    ledc_channel_config(&ledc_channel);
-
     ESP_ERROR_CHECK(esp_netif_init());
     ESP_ERROR_CHECK(esp_event_loop_create_default());
     esp_netif_create_default_wifi_sta();
 
-    // Configuración WiFi
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
     ESP_ERROR_CHECK(esp_wifi_set_mode(WIFI_MODE_STA));
